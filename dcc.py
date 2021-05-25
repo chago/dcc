@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import json
 
 from androguard.core import androconf
 from androguard.core.analysis import analysis
@@ -19,12 +20,21 @@ from dex2c.util import JniLongName, get_method_triple, get_access_method, is_syn
 
 APKTOOL = 'tools/apktool.jar'
 SIGNJAR = 'tools/signapk.jar'
+NDKBUILD = 'ndk-build'
 LIBNATIVECODE = 'libnc.so'
 
 logger = logging.getLogger('dcc')
 
 tempfiles = []
 
+def is_windows():
+    return os.name == 'nt'
+
+def cpu_count():
+    num_processes = os.cpu_count()
+    if num_processes is None:
+        num_processes = 2
+    return num_processes
 
 def make_temp_dir(prefix='dcc'):
     global tempfiles
@@ -74,9 +84,7 @@ def sign(unsigned_apk, signed_apk):
 
 
 def build_project(project_dir, num_processes=0):
-    if num_processes == 0:
-        num_processes = len((os.sched_getaffinity(0)))
-    subprocess.check_call(['ndk-build', '-j%d' % num_processes, '-C', project_dir])
+    subprocess.check_call([NDKBUILD, '-j%d' % cpu_count(), '-C', project_dir])
 
 
 def auto_vm(filename):
@@ -238,19 +246,40 @@ def copy_compiled_libs(project_dir, decompiled_dir):
 
 
 def native_class_methods(smali_path, compiled_methods):
-    def _skip_until(fp, needle):
+    def next_line():
+        return fp.readline()
+
+    def handle_annotanion():
         while True:
-            line = fp.readline()
+            line = next_line()
             if not line:
                 break
-            if line.strip() == needle:
+            s = line.strip()
+            code_lines.append(line)
+            if s == '.end annotation':
                 break
+            else:
+                continue
+
+    def handle_method_body():
+        while True:
+            line = next_line()
+            if not line:
+                break
+            s = line.strip()
+            if s == '.end method':
+                break
+            elif s.startswith('.annotation runtime') and s.find('Dex2C') < 0:
+                code_lines.append(line)
+                handle_annotanion()
+            else:
+                continue
 
     code_lines = []
     class_name = ''
     with open(smali_path, 'r') as fp:
         while True:
-            line = fp.readline()
+            line = next_line()
             if not line:
                 break
             code_lines.append(line)
@@ -262,8 +291,9 @@ def native_class_methods(smali_path, compiled_methods):
                 param = current_method.find('(')
                 name, proto = current_method[:param], current_method[param:]
                 if (class_name, name, proto) in compiled_methods:
-                    code_lines[-1] = code_lines[-1].replace(current_method, 'native ' + current_method)
-                    _skip_until(fp, '.end method')
+                    if line.find(' native ') < 0:
+                        code_lines[-1] = code_lines[-1].replace(current_method, 'native ' + current_method)
+                    handle_method_body()
                     code_lines.append('.end method\n')
 
     with open(smali_path, 'w') as fp:
@@ -347,10 +377,8 @@ def compile_dex(apkfile, filtercfg):
 
     return compiled_method_code, errors
 
-
 def is_apk(name):
     return name.endswith('.apk')
-
 
 def dcc_main(apkfile, filtercfg, outapk, do_compile=True, project_dir=None, source_archive='project-source.zip'):
     if not os.path.exists(apkfile):
@@ -416,6 +444,20 @@ if __name__ == '__main__':
         project_dir = args['source_dir']
     else:
         project_dir = None
+
+    dcc_cfg = {}
+    with open('dcc.cfg') as fp:
+        dcc_cfg = json.load(fp)
+
+    if 'ndk_dir' in dcc_cfg and os.path.exists(dcc_cfg['ndk_dir']):
+        ndk_dir = dcc_cfg['ndk_dir']
+        if is_windows():
+            NDKBUILD = os.path.join(ndk_dir, 'ndk-build.cmd')
+        else:
+            NDKBUILD = os.path.join(ndk_dir, 'ndk-build')
+
+    if 'apktool' in dcc_cfg and os.path.exists(dcc_cfg['apktool']):
+        APKTOOL = dcc_cfg['apktool']
 
     try:
         dcc_main(infile, filtercfg, outapk, do_compile, project_dir, source_archive)
